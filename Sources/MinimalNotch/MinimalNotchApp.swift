@@ -2,16 +2,6 @@ import AppKit
 import SwiftUI
 import Combine
 
-final class TrackingView: NSView {
-    var changed: ((Bool) -> Void)?
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        trackingAreas.forEach(removeTrackingArea)
-        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self))
-    }
-    override func mouseEntered(with event: NSEvent) { changed?(true) }
-    override func mouseExited(with event: NSEvent) { changed?(false) }
-}
 final class NotchPanel: NSPanel {
     var escape: (() -> Void)?
     override var canBecomeKey: Bool { true }
@@ -22,7 +12,9 @@ final class NotchPanel: NSPanel {
     private let actions = SystemActions()
     private var state = PanelState()
     private var panel: NotchPanel!
-    private var trigger: NSPanel!
+    private var notch: CGRect?
+    private var pointerInside = false
+    private var mouseMonitors: [Any] = []
     private var status: NSStatusItem!
     private var hide: DispatchWorkItem?
     private var subscriptions: Set<AnyCancellable> = []
@@ -35,18 +27,21 @@ final class NotchPanel: NSPanel {
         panel.level = .statusBar; panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.escape = { [weak self] in self?.dismiss() }
-        let tracking = TrackingView()
-        tracking.changed = { [weak self] in self?.pointer($0) }
+        panel.acceptsMouseMovedEvents = true
+        let tracking = NSView()
         let content = NSHostingView(rootView: ControlsView(actions: actions, confirm: { [weak self] in self?.confirm($0) }, dismissError: { [weak self] in self?.actions.error = nil }))
         tracking.addSubview(content)
         content.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([content.leadingAnchor.constraint(equalTo: tracking.leadingAnchor), content.trailingAnchor.constraint(equalTo: tracking.trailingAnchor), content.topAnchor.constraint(equalTo: tracking.topAnchor), content.bottomAnchor.constraint(equalTo: tracking.bottomAnchor)])
         panel.contentView = tracking
-        trigger = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        trigger.isOpaque = false; trigger.backgroundColor = .clear; trigger.hasShadow = false
-        trigger.level = .statusBar; trigger.hidesOnDeactivate = false
-        trigger.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        let activation = TrackingView(); activation.changed = { [weak self] in self?.pointer($0) }; trigger.contentView = activation
+        let mouseEvents: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
+        if let monitor = NSEvent.addGlobalMonitorForEvents(matching: mouseEvents, handler: { [weak self] _ in self?.updatePointer() }) {
+            mouseMonitors.append(monitor)
+        }
+        if let monitor = NSEvent.addLocalMonitorForEvents(matching: mouseEvents, handler: { [weak self] event in
+            self?.updatePointer()
+            return event
+        }) { mouseMonitors.append(monitor) }
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         status.button?.image = NSImage(systemSymbolName: "rectangle.topthird.inset.filled", accessibilityDescription: "MinimalNotch")
         let menu = NSMenu()
@@ -65,18 +60,25 @@ final class NotchPanel: NSPanel {
     @objc private func place() {
         screen = NSScreen.screens.first { $0.safeAreaInsets.top > 0 }
         let display = screen ?? NSScreen.main ?? NSScreen.screens.first
-        guard let display else { panel.orderOut(nil); trigger.orderOut(nil); return }
+        guard let display else { notch = nil; panel.orderOut(nil); return }
         let top = screen == nil ? display.visibleFrame.maxY : display.frame.maxY - display.safeAreaInsets.top
-        let height: CGFloat = actions.error == nil ? 125 : 265
-        panel.setFrame(NSRect(x: display.frame.midX - 132, y: top - height, width: 264, height: height), display: true)
+        let width: CGFloat = actions.error == nil ? 150 : 320
+        let height: CGFloat = actions.error == nil ? 70 : 280
+        panel.setFrame(NSRect(x: display.frame.midX - width / 2, y: top - height, width: width, height: height), display: true)
         if let screen {
             let left = screen.auxiliaryTopLeftArea?.maxX ?? (screen.frame.midX - 70)
             let right = screen.auxiliaryTopRightArea?.minX ?? (screen.frame.midX + 70)
-            // The two-point bridge sits below the housing, outside the menu bar.
-            trigger.setFrame(NSRect(x: left, y: top - 2, width: max(1, right - left), height: 2), display: true)
-            trigger.orderFrontRegardless()
-        } else { trigger.orderOut(nil) }
+            notch = CGRect(x: left, y: top, width: max(1, right - left), height: display.safeAreaInsets.top)
+        } else { notch = nil }
+        updatePointer()
     }
+    private func updatePointer() {
+        let inside = pointerInsideActions(NSEvent.mouseLocation, notch: notch, panel: panel.frame, panelVisible: state.visible)
+        guard inside != pointerInside else { return }
+        pointerInside = inside
+        pointer(inside)
+    }
+
     private func pointer(_ entered: Bool) {
         hide?.cancel()
         if entered {
@@ -137,7 +139,10 @@ final class NotchPanel: NSPanel {
         if !actions.inFlight.isEmpty { NSSound.beep(); return .terminateCancel }
         return .terminateNow
     }
-    func applicationWillTerminate(_ notification: Notification) { actions.shutdown() }
+    func applicationWillTerminate(_ notification: Notification) {
+        mouseMonitors.forEach(NSEvent.removeMonitor)
+        actions.shutdown()
+    }
 }
 @main struct MinimalNotchApp {
     static func main() {
