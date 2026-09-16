@@ -77,4 +77,41 @@ final class BehaviorTests: XCTestCase {
         }
     }
 
+    func testRestorationFailureReportsUnknown() {
+        var writes = 0
+        let transaction = FinderTransaction(read: { nil }, write: { _ in
+            writes += 1
+            if writes == 2 { throw ActionError("disk unavailable") }
+        }, restart: { throw ActionError("timeout") })
+        XCTAssertThrowsError(try transaction.toggle()) { error in
+            XCTAssertTrue(error.localizedDescription.contains("state unknown"))
+            XCTAssertTrue(error.localizedDescription.contains("restoration failed"))
+        }
+        XCTAssertEqual(writes, 2)
+    }
+
+    @MainActor func testActualSleepOptIn() throws {
+        guard ProcessInfo.processInfo.environment["MINIMAL_NOTCH_TEST_SLEEP"] == "1" else {
+            throw XCTSkip("Set MINIMAL_NOTCH_TEST_SLEEP=1 to exercise actual IOKit assertions.")
+        }
+        let actions = SystemActions(readHidden: { false }, toggleHidden: { false }, trash: {})
+        defer { actions.shutdown() }
+        var samples: [[String: Any]] = []
+        actions.timing = { action, phase, time in samples.append(["action": action.rawValue, "phase": phase, "seconds": time]) }
+        for index in 0..<102 {
+            actions.toggleSleep()
+            XCTAssertNil(actions.error)
+            XCTAssertEqual(actions.sleepPrevented, index.isMultiple(of: 2))
+            XCTAssertTrue(actions.inFlight.isEmpty)
+        }
+        XCTAssertFalse(actions.sleepPrevented)
+        actions.shutdown()
+        XCTAssertFalse(actions.sleepPrevented)
+        XCTAssertEqual(samples.count, 408)
+        if let output = ProcessInfo.processInfo.environment["MINIMAL_NOTCH_SLEEP_TIMING_OUTPUT"] {
+            let data = try JSONSerialization.data(withJSONObject: samples, options: [.sortedKeys])
+            try data.write(to: URL(fileURLWithPath: output))
+        }
+    }
+
 }
