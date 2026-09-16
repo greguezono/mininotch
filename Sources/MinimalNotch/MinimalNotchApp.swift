@@ -19,7 +19,6 @@ final class NotchPanel: NSPanel {
     private var hide: DispatchWorkItem?
     private var subscriptions: Set<AnyCancellable> = []
     private var screen: NSScreen?
-    private var dialog = false
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         panel = NotchPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
@@ -29,7 +28,7 @@ final class NotchPanel: NSPanel {
         panel.escape = { [weak self] in self?.dismiss() }
         panel.acceptsMouseMovedEvents = true
         let tracking = NSView()
-        let content = NSHostingView(rootView: ControlsView(actions: actions, confirm: { [weak self] in self?.confirm($0) }, dismissError: { [weak self] in self?.actions.error = nil }))
+        let content = NSHostingView(rootView: ControlsView(actions: actions, dismissError: { [weak self] in self?.actions.error = nil }))
         tracking.addSubview(content)
         content.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([content.leadingAnchor.constraint(equalTo: tracking.leadingAnchor), content.trailingAnchor.constraint(equalTo: tracking.trailingAnchor), content.topAnchor.constraint(equalTo: tracking.topAnchor), content.bottomAnchor.constraint(equalTo: tracking.bottomAnchor)])
@@ -43,19 +42,22 @@ final class NotchPanel: NSPanel {
             return event
         }) { mouseMonitors.append(monitor) }
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        status.button?.image = NSImage(systemSymbolName: "rectangle.topthird.inset.filled", accessibilityDescription: "MinimalNotch")
+        let icon = NSImage(named: "MinimalNotch")
+        icon?.size = NSSize(width: 18, height: 18)
+        icon?.accessibilityDescription = "MiniNotch"
+        status.button?.image = icon
         let menu = NSMenu()
         menu.addItem(withTitle: "Show / Hide Quick Actions", action: #selector(showHide), keyEquivalent: "")
-        menu.addItem(.separator()); menu.addItem(withTitle: "Quit MinimalNotch", action: #selector(quit), keyEquivalent: "q")
+        menu.addItem(.separator()); menu.addItem(withTitle: "Quit MiniNotch", action: #selector(quit), keyEquivalent: "q")
         menu.items.forEach { $0.target = self }; status.menu = menu
         NotificationCenter.default.addObserver(self, selector: #selector(place), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         actions.$error.dropFirst().receive(on: RunLoop.main).sink { [weak self] error in
             guard let self else { return }
-            state.hold = dialog || error != nil
+            state.hold = error != nil
             if error != nil { state.enter(); state.exit() }
             place(); render(); scheduleHide()
         }.store(in: &subscriptions)
-        place(); actions.refreshHiddenFiles()
+        place()
     }
     @objc private func place() {
         screen = NSScreen.screens.first { $0.safeAreaInsets.top > 0 }
@@ -82,9 +84,7 @@ final class NotchPanel: NSPanel {
     private func pointer(_ entered: Bool) {
         hide?.cancel()
         if entered {
-            let wasVisible = state.visible
             state.enter()
-            if !wasVisible { actions.refreshHiddenFiles() }
             render()
         } else { state.exit(); scheduleHide() }
     }
@@ -103,36 +103,10 @@ final class NotchPanel: NSPanel {
             }
         } else { panel.orderOut(nil) }
     }
-    private func dismiss() { guard !dialog else { return }; state.escape(); render() }
+    private func dismiss() { state.escape(); render() }
     @objc private func showHide() {
         if state.visible { dismiss() }
-        else { state.showKeyboard(); actions.refreshHiddenFiles(); render(); NSApp.activate(); panel.makeKey() }
-    }
-    private func confirm(_ action: SystemActions.Action) {
-        guard !dialog && !actions.inFlight.contains(action) else { return }
-        dialog = true; state.hold = true
-        let alert = NSAlert()
-        if action == .hidden {
-            alert.messageText = "Restart Finder to toggle hidden files?"
-            alert.informativeText = "Finder must be idle: no copy, move, delete, or other file operation. Finder windows may close briefly. Keep Finder idle until this action finishes."
-            alert.addButton(withTitle: "Finder Is Idle — Continue")
-        } else {
-            alert.messageText = "Empty Trash?"
-            alert.informativeText = "Finder will permanently delete the items in Trash. This cannot be undone."
-            alert.addButton(withTitle: "Empty Trash")
-        }
-        alert.addButton(withTitle: "Cancel")
-        alert.buttons[0].keyEquivalent = ""; alert.buttons[1].keyEquivalent = "\r"
-        NSApp.activate(); panel.makeKey()
-        alert.beginSheetModal(for: panel) { [weak self] response in
-            guard let self else { return }
-            dialog = false; state.hold = actions.error != nil
-            let confirmed = response == .alertFirstButtonReturn
-            if action == .hidden { actions.toggleHiddenFiles(confirmed: confirmed) }
-            else { actions.emptyTrash(confirmed: confirmed) }
-            // Mouse dialogs do not leave keyboard presentation pinned open.
-            scheduleHide()
-        }
+        else { state.showKeyboard(); render(); NSApp.activate(); panel.makeKey() }
     }
     @objc private func quit() { NSApp.terminate(nil) }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

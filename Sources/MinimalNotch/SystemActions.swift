@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import IOKit.pwr_mgt
 import OSLog
 
@@ -8,82 +9,39 @@ struct ActionError: LocalizedError {
     var errorDescription: String? { message }
 }
 
-struct FinderTransaction {
-    var read: () throws -> Any?
-    var write: (Any?) throws -> Void
-    var restart: () throws -> Void
-    func toggle() throws -> Bool {
-        let saved = try read()
-        let target = !Self.bool(saved)
-        do {
-            try write(target)
-            try restart()
-            guard Self.bool(try read()) == target else { throw ActionError("Finder preference readback failed.") }
-            return target
-        } catch {
-            do { try write(saved) }
-            catch { throw ActionError("Finder state unknown; preference restoration failed: \(error.localizedDescription)") }
-            throw ActionError("Finder state unknown. Original preference restored; reopen Finder when idle. \(error.localizedDescription)")
-        }
-    }
-    static func bool(_ value: Any?) -> Bool {
-        if let number = value as? NSNumber { return number.boolValue }
-        return (value as? NSString)?.boolValue ?? false
-    }
-}
-
 final class NativeFinder {
-    private let domain = "com.apple.finder" as CFString
-    private let key = "AppleShowAllFiles" as CFString
-    private var pendingQuit: NSRunningApplication?
-    func read() throws -> Any? {
-        guard CFPreferencesSynchronize(domain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost) else {
-            throw ActionError("Could not read Finder preferences.")
-        }
-        return CFPreferencesCopyValue(key, domain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
-    }
-    func write(_ value: Any?) throws {
-        CFPreferencesSetValue(key, value as CFPropertyList?, domain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
-        let observed = try read()
-        guard NSDictionary(dictionary: observed.map { ["value": $0] } ?? [:]).isEqual(to: value.map { ["value": $0] } ?? [:]) else {
-            throw ActionError("Finder preference write failed.")
+    static func requirePostingAccess(preflight: () -> Bool = CGPreflightPostEventAccess, request: () -> Bool = CGRequestPostEventAccess) throws {
+        guard preflight() || request() else {
+            throw ActionError("Allow MiniNotch in the macOS Accessibility prompt or System Settings → Privacy & Security → Accessibility, then retry. If it is already enabled but access is still denied, the saved permission may refer to an older build; see README’s permission reset steps.")
         }
     }
-    func restart() throws {
-        if let pendingQuit, !pendingQuit.isTerminated {
-            throw ActionError("A previous Finder quit remains unresolved. Wait and reopen Finder manually.")
+    static func hiddenFileShortcut() throws -> (down: CGEvent, up: CGEvent) {
+        guard let source = CGEventSource(stateID: .privateState),
+              let down = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_Period), keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_Period), keyDown: false) else {
+            throw ActionError("Could not create the Finder keyboard shortcut.")
         }
-        pendingQuit = nil
-        if let finder = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first {
-            pendingQuit = finder
-            guard finder.terminate() else { throw ActionError("Finder refused to quit normally.") }
-            let deadline = ProcessInfo.processInfo.systemUptime + 10
-            while !finder.isTerminated {
-                guard ProcessInfo.processInfo.systemUptime < deadline else { throw ActionError("Finder quit timed out; no force quit was used.") }
-                RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
-            }
-            pendingQuit = nil
-        }
-        let semaphore = DispatchSemaphore(value: 0)
-        var failure: Error?
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = false
-        NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: "/System/Library/CoreServices/Finder.app"), configuration: configuration) { app, error in
-            failure = error ?? (app == nil ? ActionError("Finder did not launch.") : nil)
-            semaphore.signal()
-        }
-        guard semaphore.wait(timeout: .now() + 10) == .success else { throw ActionError("Finder launch timed out.") }
-        if let failure { throw failure }
+        down.flags = [.maskCommand, .maskShift]
+        up.flags = [.maskCommand, .maskShift]
+        return (down, up)
     }
-    func toggle() throws -> Bool { try FinderTransaction(read: read, write: write, restart: restart).toggle() }
-    static func emptyTrash() throws {
+    static func toggle() throws {
+        guard let finder = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first,
+              !finder.isTerminated else {
+            throw ActionError("Open a Finder window, then try Toggle hidden files again.")
+        }
+        try requirePostingAccess()
+        let events = try hiddenFileShortcut()
+        events.down.postToPid(finder.processIdentifier)
+        events.up.postToPid(finder.processIdentifier)
+    }
+    static func emptyTrash(script: NSAppleScript = NSAppleScript(source: "with timeout of 30 seconds\ntell application \"Finder\"\nif exists items of trash then empty trash\nend tell\nend timeout")!) throws {
         var error: NSDictionary?
-        let script = NSAppleScript(source: "with timeout of 30 seconds\ntell application \"Finder\" to empty trash\nend timeout")!
         script.executeAndReturnError(&error)
         if let error {
             let code = error[NSAppleScript.errorNumber] as? Int
-            if code == -1743 { throw ActionError("Allow MinimalNotch to control Finder in System Settings → Privacy & Security → Automation.") }
-            if code == -128 { throw ActionError("Empty Trash was cancelled.") }
+            if code == -1743 { throw ActionError("Allow MiniNotch to control Finder in System Settings → Privacy & Security → Automation.") }
+            if code == -128 { return }
             if code == -1712 { throw ActionError("Finder timed out. Trash completion is unknown; check Finder before retrying.") }
             throw ActionError("Finder could not empty Trash: \(error[NSAppleScript.errorMessage] ?? error)")
         }
@@ -92,45 +50,29 @@ final class NativeFinder {
 
 @MainActor final class SystemActions: ObservableObject {
     enum Action: String, CaseIterable { case hidden, sleep, trash }
-    @Published private(set) var hiddenFiles: Bool?
     @Published private(set) var sleepPrevented = false
+    // ponytail: tracks this session's shortcuts; use Finder state observation if external changes must sync.
+    @Published private(set) var hiddenFilesShown = false
     @Published private(set) var inFlight: Set<Action> = []
     @Published var error: String?
     private var assertion: IOPMAssertionID = 0
-    private var hiddenUncertain = false
     private let queue = DispatchQueue(label: "MinimalNotch.Finder")
-    private let readHidden: () throws -> Bool
-    private let toggleHidden: () throws -> Bool
+    private let toggleHidden: () throws -> Void
     private let trash: () throws -> Void
     private let log = OSLog(subsystem: "local.greguezono.MinimalNotch", category: .pointsOfInterest)
     // Test-only observer; production uses OSLog and never injects destructive diagnostic work.
     var timing: ((Action, String, Double) -> Void)?
-    init(readHidden: @escaping () throws -> Bool, toggleHidden: @escaping () throws -> Bool, trash: @escaping () throws -> Void) {
-        self.readHidden = readHidden; self.toggleHidden = toggleHidden; self.trash = trash
+    init(toggleHidden: @escaping () throws -> Void, trash: @escaping () throws -> Void) {
+        self.toggleHidden = toggleHidden; self.trash = trash
     }
     convenience init() {
-        let finder = NativeFinder()
-        self.init(readHidden: { FinderTransaction.bool(try finder.read()) }, toggleHidden: finder.toggle, trash: NativeFinder.emptyTrash)
+        self.init(toggleHidden: NativeFinder.toggle, trash: { try NativeFinder.emptyTrash() })
     }
     private func mark(_ action: Action, _ phase: String) {
         os_signpost(.event, log: log, name: "Action", "%{public}s %{public}s", action.rawValue, phase)
         timing?(action, phase, ProcessInfo.processInfo.systemUptime)
     }
-    func refreshHiddenFiles() {
-        guard !inFlight.contains(.hidden), !hiddenUncertain else { return }
-        let read = readHidden
-        queue.async { [self] in
-            let result = Result { try read() }
-            DispatchQueue.main.async { [self] in
-                guard !inFlight.contains(.hidden), !hiddenUncertain else { return }
-                switch result {
-                case .success(let state): hiddenFiles = state
-                case .failure(let failure): hiddenFiles = nil; error = failure.localizedDescription
-                }
-            }
-        }
-    }
-    private func run(_ action: Action, work: @escaping () throws -> Bool?, completion: @escaping (Bool?) -> Void) {
+    private func run(_ action: Action, work: @escaping () throws -> Void) {
         guard !inFlight.contains(action) else { return }
         mark(action, "input"); inFlight.insert(action); mark(action, "feedback")
         mark(action, "enqueue")
@@ -139,29 +81,27 @@ final class NativeFinder {
             DispatchQueue.main.async { [self] in
                 inFlight.remove(action)
                 switch result {
-                case .success(let value): completion(value)
+                case .success:
+                    if action == .hidden { hiddenFilesShown.toggle() }
                 case .failure(let failure):
-                    if action == .hidden { hiddenFiles = nil; hiddenUncertain = true }
                     error = failure.localizedDescription
                 }
                 mark(action, "completion")
             }
         }
     }
-    func toggleHiddenFiles(confirmed: Bool) {
-        guard confirmed else { return }
-        run(.hidden, work: { [self] in try toggleHidden() }) { [self] in hiddenFiles = $0; hiddenUncertain = false }
+    func toggleHiddenFiles() {
+        run(.hidden, work: toggleHidden)
     }
-    func emptyTrash(confirmed: Bool) {
-        guard confirmed else { return }
-        run(.trash, work: { [self] in try trash(); return nil }) { _ in }
+    func emptyTrash() {
+        run(.trash, work: trash)
     }
     func toggleSleep() {
         mark(.sleep, "input"); inFlight.insert(.sleep); mark(.sleep, "feedback"); mark(.sleep, "enqueue")
         let status: IOReturn
         if assertion == 0 {
             var created: IOPMAssertionID = 0
-            status = IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep as CFString, IOPMAssertionLevel(kIOPMAssertionLevelOn), "MinimalNotch Keep Awake" as CFString, &created)
+            status = IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep as CFString, IOPMAssertionLevel(kIOPMAssertionLevelOn), "MiniNotch Keep Awake" as CFString, &created)
             if status == kIOReturnSuccess { assertion = created }
         } else {
             status = IOPMAssertionRelease(assertion)
