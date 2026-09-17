@@ -1,6 +1,6 @@
 # MiniNotch
 
-Three native controls below the camera notch: hidden files, idle sleep prevention, and Empty Trash. Hover below the housing to reveal; use the menu-bar Show / Hide entry for keyboard access. Escape dismisses. Requires macOS 14 or later and Xcode command-line tools.
+Three native controls below the camera notch: hidden files, idle sleep prevention, and Empty Trash. Hover below the housing to reveal; use the menu-bar Show / Hide entry for keyboard access. Escape dismisses. Requires macOS 26 or later and Xcode command-line tools.
 
 ```sh
 rtk swift test
