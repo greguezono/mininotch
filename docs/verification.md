@@ -123,3 +123,15 @@ Fresh `swift test`: 9 tests, 1 intentional real-sleep skip, 0 failures. Computer
 ### User-confirmed working checkpoint — 2026-09-16
 
 Greg confirmed that the hidden-files button changes Finder visibility and that the app is in a working state. Together with the matching certificate requirement and allowed PostEvent checks above, this confirms local Accessibility recovery and live Finder delivery. Retention after an actual installed update remains a separate pending check. User requested committing this working state and integrating it into main.
+
+### Permission recovery UX — 2026-09-18
+
+Accessibility and Finder Automation denials now carry a structured recovery target from `NativeFinder` through `SystemActions.Failure` to the panel, which adds an Open Settings button beside Dismiss. Ordinary failures and Trash timeout carry no target; cancellation stays silent. A displayed failure clears only when its own action later succeeds; unrelated successes leave it in place. `NativeFinder.toggle` gained injectable Finder PID, access check, and post closures so tests observe that a denied check never posts events. Inline denial copy no longer suggests a consent reset; the README keeps the diagnosed stale-identity steps. Apple Events usage description now reads "MiniNotch asks Finder to check and empty Trash when you click Empty Trash." in source and in the built bundle; `plutil -lint` passed.
+
+`swift test`: 13 tests, 1 opt-in sleep skip, 0 failures. Signed release build passed strict verification with the unchanged designated requirement (identifier plus pinned certificate leaf). On macOS 26.6.2, `x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility` and `?Privacy_Automation` each opened System Settings on the matching list, confirmed by screenshot. System Settings was quit afterward; no consent was changed and the installed /Applications/MiniNotch.app was not replaced.
+
+Pending: Greg's native first-use/denial observation in a disposable environment, live layout and VoiceOver check of the two-button row, and the update-retention experiment described in the design spec.
+
+### Fresh-install end-to-end — 2026-09-18
+
+Preserved installed build A at `~/MiniNotch-rollback/A` (executable sha256 prefix 49db4b83), built B (prefix e40eeb8c) with the same designated requirement, quit A, reset this app's Accessibility and AppleEvents consent with `tccutil`, installed B at /Applications/MiniNotch.app and launched it as PID 75038 at 01:04:44. Trash was empty throughout. Greg walked the first-use flow: Accessibility denial showed the recovery message with Open Settings, Settings opened on the Accessibility list, and the hidden-files action worked after granting. Finding: the running process did not pick up the new Accessibility grant; quitting and reopening MiniNotch was required before the retry succeeded. Denial copy and README now say so. Automation flow reported working. `log show` returned no tccd lines for the window, so authorization evidence for this run is Greg's observation only.

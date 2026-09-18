@@ -3,16 +3,27 @@ import Carbon.HIToolbox
 import IOKit.pwr_mgt
 import OSLog
 
+enum PermissionRecovery {
+    case accessibility, automation
+    var settingsURL: URL {
+        switch self {
+        case .accessibility: return URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+        case .automation: return URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")!
+        }
+    }
+}
+
 struct ActionError: LocalizedError {
     let message: String
-    init(_ message: String) { self.message = message }
+    let recovery: PermissionRecovery?
+    init(_ message: String, recovery: PermissionRecovery? = nil) { self.message = message; self.recovery = recovery }
     var errorDescription: String? { message }
 }
 
 final class NativeFinder {
     static func requirePostingAccess(preflight: () -> Bool = CGPreflightPostEventAccess, request: () -> Bool = CGRequestPostEventAccess) throws {
         guard preflight() || request() else {
-            throw ActionError("Allow MiniNotch in the macOS Accessibility prompt or System Settings → Privacy & Security → Accessibility, then retry. If it is already enabled but access is still denied, the saved permission may refer to an older build; see README’s permission reset steps.")
+            throw ActionError("MiniNotch needs Accessibility access to send Finder’s hidden-files shortcut. Enable MiniNotch in System Settings → Privacy & Security → Accessibility, then quit and reopen MiniNotch and click Toggle hidden files again.", recovery: .accessibility)
         }
     }
     static func hiddenFileShortcut() throws -> (down: CGEvent, up: CGEvent) {
@@ -25,22 +36,22 @@ final class NativeFinder {
         up.flags = [.maskCommand, .maskShift]
         return (down, up)
     }
-    static func toggle() throws {
-        guard let finder = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first,
-              !finder.isTerminated else {
-            throw ActionError("Open a Finder window, then try Toggle hidden files again.")
-        }
-        try requirePostingAccess()
+    static func finderPID() -> pid_t? {
+        NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first { !$0.isTerminated }?.processIdentifier
+    }
+    static func toggle(finder: pid_t? = finderPID(), access: () throws -> Void = { try requirePostingAccess() }, post: (CGEvent, pid_t) -> Void = { $0.postToPid($1) }) throws {
+        guard let finder else { throw ActionError("Open a Finder window, then try Toggle hidden files again.") }
+        try access()
         let events = try hiddenFileShortcut()
-        events.down.postToPid(finder.processIdentifier)
-        events.up.postToPid(finder.processIdentifier)
+        post(events.down, finder)
+        post(events.up, finder)
     }
     static func emptyTrash(script: NSAppleScript = NSAppleScript(source: "with timeout of 30 seconds\ntell application \"Finder\"\nif exists items of trash then empty trash\nend tell\nend timeout")!) throws {
         var error: NSDictionary?
         script.executeAndReturnError(&error)
         if let error {
             let code = error[NSAppleScript.errorNumber] as? Int
-            if code == -1743 { throw ActionError("Allow MiniNotch to control Finder in System Settings → Privacy & Security → Automation.") }
+            if code == -1743 { throw ActionError("MiniNotch needs permission to control Finder to empty Trash. Enable Finder under MiniNotch in System Settings → Privacy & Security → Automation. Click Empty Trash again only when you want to empty it.", recovery: .automation) }
             if code == -128 { return }
             if code == -1712 { throw ActionError("Finder timed out. Trash completion is unknown; check Finder before retrying.") }
             throw ActionError("Finder could not empty Trash: \(error[NSAppleScript.errorMessage] ?? error)")
@@ -50,11 +61,12 @@ final class NativeFinder {
 
 @MainActor final class SystemActions: ObservableObject {
     enum Action: String, CaseIterable { case hidden, sleep, trash }
+    struct Failure: Equatable { let action: Action; let message: String; let recovery: PermissionRecovery? }
     @Published private(set) var sleepPrevented = false
     // ponytail: tracks this session's shortcuts; use Finder state observation if external changes must sync.
     @Published private(set) var hiddenFilesShown = false
     @Published private(set) var inFlight: Set<Action> = []
-    @Published var error: String?
+    @Published var error: Failure?
     private var assertion: IOPMAssertionID = 0
     private let queue = DispatchQueue(label: "MinimalNotch.Finder")
     private let toggleHidden: () throws -> Void
@@ -66,7 +78,7 @@ final class NativeFinder {
         self.toggleHidden = toggleHidden; self.trash = trash
     }
     convenience init() {
-        self.init(toggleHidden: NativeFinder.toggle, trash: { try NativeFinder.emptyTrash() })
+        self.init(toggleHidden: { try NativeFinder.toggle() }, trash: { try NativeFinder.emptyTrash() })
     }
     private func mark(_ action: Action, _ phase: String) {
         os_signpost(.event, log: log, name: "Action", "%{public}s %{public}s", action.rawValue, phase)
@@ -83,8 +95,9 @@ final class NativeFinder {
                 switch result {
                 case .success:
                     if action == .hidden { hiddenFilesShown.toggle() }
+                    if error?.action == action { error = nil }
                 case .failure(let failure):
-                    error = failure.localizedDescription
+                    error = Failure(action: action, message: failure.localizedDescription, recovery: (failure as? ActionError)?.recovery)
                 }
                 mark(action, "completion")
             }
@@ -108,7 +121,8 @@ final class NativeFinder {
             if status == kIOReturnSuccess { assertion = 0 }
         }
         sleepPrevented = assertion != 0
-        if status != kIOReturnSuccess { error = "Could not change sleep prevention (\(status))." }
+        if status != kIOReturnSuccess { error = Failure(action: .sleep, message: "Could not change sleep prevention (\(status)).", recovery: nil) }
+        else if error?.action == .sleep { error = nil }
         inFlight.remove(.sleep); mark(.sleep, "completion")
     }
     func shutdown() { if assertion != 0 { IOPMAssertionRelease(assertion); assertion = 0; sleepPrevented = false } }

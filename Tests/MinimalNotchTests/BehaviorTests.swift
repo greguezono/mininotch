@@ -70,13 +70,16 @@ final class BehaviorTests: XCTestCase {
         }
     }
     @MainActor func testTrashCancellationIsSilentAndFailuresRemainVisible() async {
-        for (source, expectedError) in [("return", false), ("error number -128", false), ("error number -1743", true), ("error number -1712", true)] {
+        let cases: [(String, Bool, PermissionRecovery?)] = [("return", false, nil), ("error number -128", false, nil), ("error number -1743", true, .automation), ("error number -1712", true, nil), ("error number -10000", true, nil)]
+        for (source, expectedError, recovery) in cases {
             let actions = SystemActions(toggleHidden: {}, trash: {
                 try NativeFinder.emptyTrash(script: NSAppleScript(source: source)!)
             })
             actions.emptyTrash()
             while !actions.inFlight.isEmpty { await Task.yield() }
             XCTAssertEqual(actions.error != nil, expectedError, source)
+            XCTAssertEqual(actions.error?.recovery, recovery, source)
+            XCTAssertEqual(actions.error?.action, expectedError ? .trash : nil, source)
         }
     }
     @MainActor func testDuplicateAndFailure() async {
@@ -87,7 +90,7 @@ final class BehaviorTests: XCTestCase {
         XCTAssertEqual(calls, 1); XCTAssertNotNil(actions.error)
         actions.toggleHiddenFiles()
         while !actions.inFlight.isEmpty { await Task.yield() }
-        XCTAssertEqual(actions.error, "denied")
+        XCTAssertEqual(actions.error?.message, "denied")
         XCTAssertFalse(actions.hiddenFilesShown)
     }
     @MainActor func testInjectedTimingAndErrors() async throws {
@@ -109,11 +112,53 @@ final class BehaviorTests: XCTestCase {
             let failure = SystemActions(toggleHidden: { throw ActionError(message) }, trash: { throw ActionError(message) })
             failure.toggleHiddenFiles()
             while !failure.inFlight.isEmpty { await Task.yield() }
-            XCTAssertTrue(failure.error?.contains(message) == true)
+            XCTAssertTrue(failure.error?.message.contains(message) == true)
             failure.emptyTrash()
             while !failure.inFlight.isEmpty { await Task.yield() }
-            XCTAssertTrue(failure.error?.contains(message) == true)
+            XCTAssertTrue(failure.error?.message.contains(message) == true)
         }
+    }
+
+    func testAccessibilityDenialCarriesRecoveryAndRequestsEachTime() {
+        var requests = 0
+        for _ in 0..<2 {
+            XCTAssertThrowsError(try NativeFinder.requirePostingAccess(preflight: { false }, request: { requests += 1; return false })) {
+                XCTAssertEqual(($0 as? ActionError)?.recovery, .accessibility)
+            }
+        }
+        XCTAssertEqual(requests, 2)
+    }
+    func testDeniedToggleNeverPosts() {
+        var posts = 0
+        XCTAssertThrowsError(try NativeFinder.toggle(finder: 1, access: { throw ActionError("denied", recovery: .accessibility) }, post: { _, _ in posts += 1 })) {
+            XCTAssertEqual(($0 as? ActionError)?.recovery, .accessibility)
+        }
+        XCTAssertEqual(posts, 0)
+        XCTAssertThrowsError(try NativeFinder.toggle(finder: nil, access: { XCTFail("access checked without Finder") }, post: { _, _ in XCTFail("posted without Finder") })) {
+            XCTAssertNil(($0 as? ActionError)?.recovery)
+        }
+        XCTAssertNoThrow(try NativeFinder.toggle(finder: 1, access: {}, post: { _, _ in posts += 1 }))
+        XCTAssertEqual(posts, 2)
+    }
+    @MainActor func testSuccessfulRetryClearsOnlyItsOwnFailure() async {
+        var denied = true
+        let actions = SystemActions(toggleHidden: { if denied { throw ActionError("denied", recovery: .accessibility) } }, trash: {})
+        actions.toggleHiddenFiles()
+        while !actions.inFlight.isEmpty { await Task.yield() }
+        XCTAssertEqual(actions.error, SystemActions.Failure(action: .hidden, message: "denied", recovery: .accessibility))
+        XCTAssertFalse(actions.hiddenFilesShown)
+        actions.emptyTrash()
+        while !actions.inFlight.isEmpty { await Task.yield() }
+        XCTAssertNotNil(actions.error)
+        denied = false
+        actions.toggleHiddenFiles()
+        while !actions.inFlight.isEmpty { await Task.yield() }
+        XCTAssertNil(actions.error)
+        XCTAssertTrue(actions.hiddenFilesShown)
+    }
+    func testSettingsDestinations() {
+        XCTAssertEqual(PermissionRecovery.accessibility.settingsURL.absoluteString, "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+        XCTAssertEqual(PermissionRecovery.automation.settingsURL.absoluteString, "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")
     }
 
     @MainActor func testActualSleepOptIn() throws {
