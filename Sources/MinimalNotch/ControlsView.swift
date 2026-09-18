@@ -52,10 +52,15 @@ struct ControlsView: View {
                 .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
             if let error = actions.error {
                 ScrollView {
-                    Text(error).font(.system(size: 12)).foregroundStyle(.white)
+                    Text(error.message).font(.system(size: 12)).foregroundStyle(.white)
                         .frame(maxWidth: .infinity, alignment: .leading).fixedSize(horizontal: false, vertical: true)
                 }
-                Button("Dismiss", action: dismissError).keyboardShortcut(.cancelAction)
+                HStack(spacing: 8) {
+                    if let recovery = error.recovery {
+                        Button("Open Settings") { NSWorkspace.shared.open(recovery.settingsURL) }
+                    }
+                    Button("Dismiss", action: dismissError).keyboardShortcut(.cancelAction)
+                }
             }
         }
         .padding(.horizontal, 13).padding(.top, 8).padding(.bottom, 6)

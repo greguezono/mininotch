@@ -10,5 +10,5 @@
 <key>CFBundleVersion</key><string>1</string>
 <key>LSMinimumSystemVersion</key><string>26.0</string>
 <key>LSUIElement</key><true/>
-<key>NSAppleEventsUsageDescription</key><string>MiniNotch asks Finder to empty Trash only after your confirmation.</string>
+<key>NSAppleEventsUsageDescription</key><string>MiniNotch asks Finder to check and empty Trash when you click Empty Trash.</string>
 </dict></plist>
