@@ -65,7 +65,7 @@ struct ControlsView: View {
         }
         .padding(.horizontal, 13).padding(.top, 8).padding(.bottom, 6)
         .frame(width: actions.error == nil ? 150 : 320, height: actions.error == nil ? 70 : 280, alignment: .top)
-        .glassEffect(.clear.interactive(), in: panel)
+        .glassEffect(.clear, in: panel)
         .background(panel.fill(dim))
         .overlay(panel.strokeBorder(panelRim, lineWidth: 1))
         .colorScheme(.dark)
