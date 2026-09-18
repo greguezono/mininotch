@@ -23,7 +23,7 @@ struct ActionError: LocalizedError {
 final class NativeFinder {
     static func requirePostingAccess(preflight: () -> Bool = CGPreflightPostEventAccess, request: () -> Bool = CGRequestPostEventAccess) throws {
         guard preflight() || request() else {
-            throw ActionError("MiniNotch needs Accessibility access to send Finder’s hidden-files shortcut. Enable MiniNotch in System Settings → Privacy & Security → Accessibility, then click Toggle hidden files again.", recovery: .accessibility)
+            throw ActionError("MiniNotch needs Accessibility access to send Finder’s hidden-files shortcut. Enable MiniNotch in System Settings → Privacy & Security → Accessibility, then quit and reopen MiniNotch and click Toggle hidden files again.", recovery: .accessibility)
         }
     }
     static func hiddenFileShortcut() throws -> (down: CGEvent, up: CGEvent) {
